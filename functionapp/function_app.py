@@ -1,59 +1,125 @@
-"""Azure Functions Python v2: calculation API backed by Azure Table Storage."""
-import json
-import logging
 import os
 import uuid
 from datetime import datetime, timezone
 
-import azure.functions as func
-from azure.core.exceptions import AzureError
-from azure.data.tables import TableClient
+from flask import Flask, request, jsonify
 from azure.identity import DefaultAzureCredential
+from azure.data.tables import TableServiceClient
 
-app = func.FunctionApp(http_auth_level=func.AuthLevel.FUNCTION)
+app = Flask(__name__)
+
+# Storage Account name, NOT its full URL
+STORAGE_ACCOUNT_NAME = os.getenv(
+    "STORAGE_ACCOUNT_NAME",
+    "stcalcatb"
+)
+
+TABLE_NAME = "Calculations"
+
+TABLE_ENDPOINT = (
+    f"https://{STORAGE_ACCOUNT_NAME}.table.core.windows.net"
+)
+
+# Authenticate using the VM's Managed Identity
+credential = DefaultAzureCredential(
+    exclude_interactive_browser_credential=True
+)
+
+table_service = TableServiceClient(
+    endpoint=TABLE_ENDPOINT,
+    credential=credential
+)
+
+table_client = table_service.get_table_client(
+    table_name=TABLE_NAME
+)
 
 
-@app.route(route="calculate", methods=["POST"])
-def calculate(req: func.HttpRequest) -> func.HttpResponse:
-    try:
-        payload = req.get_json()
-        if not isinstance(payload, dict):
-            raise ValueError("JSON object required")
-        a, b = payload["a"], payload["b"]
-        operation = payload.get("operation", "add")
-        if type(a) not in (int, float) or type(b) not in (int, float):
-            raise ValueError("a and b must be numeric")
-        if operation not in {"add", "subtract", "multiply", "divide"}:
-            raise ValueError("operation must be add, subtract, multiply or divide")
-        if operation == "divide" and b == 0:
-            raise ValueError("division by zero")
-        result = {"add": lambda: a + b, "subtract": lambda: a - b,
-                  "multiply": lambda: a * b, "divide": lambda: a / b}[operation]()
-    except (ValueError, KeyError, TypeError) as exc:
-        return func.HttpResponse(json.dumps({"error": str(exc)}), status_code=400,
-                                 mimetype="application/json")
+@app.route("/api/calculate", methods=["POST"])
+def calculate():
 
-    account = os.getenv("DATA_STORAGE_ACCOUNT")
-    if not account:
-        return func.HttpResponse('{"error":"DATA_STORAGE_ACCOUNT setting missing"}',
-                                 status_code=500, mimetype="application/json")
+    data = request.get_json(silent=True)
+
+    if not isinstance(data, dict):
+        return jsonify({
+            "error": "Invalid JSON body"
+        }), 400
+
+    operation = data.get("operation")
+    a = data.get("a")
+    b = data.get("b")
+
+    if operation not in ["add", "subtract", "multiply", "divide"]:
+        return jsonify({
+            "error": "Unsupported operation"
+        }), 400
+
+    if (
+        isinstance(a, bool)
+        or isinstance(b, bool)
+        or not isinstance(a, (int, float))
+        or not isinstance(b, (int, float))
+    ):
+        return jsonify({
+            "error": "a and b must be numbers"
+        }), 400
+
+    if operation == "add":
+        result = a + b
+
+    elif operation == "subtract":
+        result = a - b
+
+    elif operation == "multiply":
+        result = a * b
+
+    elif operation == "divide":
+        if b == 0:
+            return jsonify({
+                "error": "Division by zero"
+            }), 400
+
+        result = a / b
+
+    row_key = str(uuid.uuid4())
+
     entity = {
-        "PartitionKey": "calculations", "RowKey": str(uuid.uuid4()),
-        "Operation": operation, "A": float(a), "B": float(b),
-        "Result": float(result), "CreatedAt": datetime.now(timezone.utc).isoformat()
+        "PartitionKey": "calculations",
+        "RowKey": row_key,
+        "Operation": operation,
+        "A": float(a),
+        "B": float(b),
+        "Result": float(result),
+        "CreatedAt": datetime.now(timezone.utc).isoformat()
     }
+
     try:
-        with TableClient(
-            endpoint=f"https://{account}.table.core.windows.net",
-            table_name="Calculations",
-            credential=DefaultAzureCredential(exclude_interactive_browser_credential=True),
-        ) as table:
-            table.create_entity(entity)
-    except AzureError:
-        logging.exception("Table Storage write failed")
-        return func.HttpResponse('{"error":"Table Storage write failed"}',
-                                 status_code=502, mimetype="application/json")
-    return func.HttpResponse(json.dumps({
-        "operation": operation, "a": a, "b": b, "result": result,
-        "rowKey": entity["RowKey"], "status": "stored"
-    }), status_code=200, mimetype="application/json")
+        table_client.create_entity(entity=entity)
+
+    except Exception:
+        app.logger.exception("Failed to write to Table Storage")
+        return jsonify({
+            "error": "Storage operation failed"
+        }), 500
+
+    return jsonify({
+        "operation": operation,
+        "a": a,
+        "b": b,
+        "result": result,
+        "rowKey": row_key,
+        "status": "stored"
+    }), 200
+
+
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "healthy"}), 200
+
+
+if __name__ == "__main__":
+    app.run(
+        host="0.0.0.0",
+        port=5000,
+        debug=False
+    )
