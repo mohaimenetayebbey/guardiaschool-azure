@@ -1,669 +1,775 @@
-# TP étudiant — Déployer, connecter et sécuriser une application serverless Azure
+# TP Azure — Du réseau public au réseau privé avec des VM, Flask, les identités managées et Table Storage
 
-**Certifications abordées :** AZ-900, AZ-104 et AZ-500  
-**Durée indicative :** 3 à 4 heures en séance guidée  
-**Méthode :** **Azure Portal** pour la création et la configuration des ressources ; **Ubuntu VM** pour le développement, le déploiement et les tests CLI.  
-**Objectif pédagogique :** apprendre les concepts Azure par la pratique, en provoquant puis en résolvant des problèmes de connectivité et d'accès.
+**Certifications :** AZ-900 · AZ-104 · AZ-500  
+**Durée estimée :** 3 à 4 heures (prévoir du temps supplémentaire pour le provisionnement Azure et la propagation des rôles RBAC)  
+**Environnement :** Portail Azure en priorité ; Ubuntu 24.04 LTS ; Python 3.12 ; Azure CLI ; PowerShell sur Windows  
+**Objectif :** Déployer une API Python de calcul, la rendre accessible publiquement, l'isoler, rétablir son accès par peering entre VNets, puis rendre Azure Table Storage privé, sans secrets applicatifs.
 
-> **Consigne importante :** aucun script de déploiement d'infrastructure n'est utilisé. Créez toutes les ressources, les règles réseau et les paramètres de sécurité depuis **https://portal.azure.com**. Les commandes servent uniquement à installer les outils, créer et publier le code, se connecter en SSH, tester les services et consulter les données.
+> **Abonnement :** Ce TP utilise deux petites VM au lieu d'une Azure Function App, car certains abonnements d'essai ne permettent pas de déployer les plans d'hébergement requis. Les VM, disques, IP publiques et Private Endpoints peuvent être facturés ou consommer des crédits. Vérifiez les quotas et tailles de VM disponibles. Supprimez les ressources à la fin.
+>
+> **Sécurité :** Le serveur de développement intégré à Flask est réservé à ce TP temporaire, pas à la production. Limitez le port public 5000 aux adresses IP des étudiants concernés et supprimez l'exposition publique pendant l'exercice. HTTP n'est pas chiffré : ne transmettez aucun secret.
 
-## 0. Scénario, architecture et prérequis (15 min)
+## 1. Objectifs pédagogiques
 
-Votre entreprise dispose d'une API de calcul. Les clients transmettent deux nombres et une opération (`add`, `subtract`, `multiply`, `divide`). L'API calcule le résultat et l'enregistre dans **Azure Table Storage**. Initialement, l'API est accessible depuis Internet. Votre mission consiste à rendre cette API privée, puis à y accéder depuis une VM d'administration Ubuntu située dans **un autre Virtual Network**. Vous mettrez en place le **VNet peering**, les **Private Endpoints** et le **Private DNS**, avant de consulter les résultats via **Azure CLI**.
+À la fin du TP, vous saurez :
 
-### Architecture cible
+- Expliquer les groupes de ressources, VNets, sous-réseaux, adresses IP publiques/privées, NSG et VNet Peering.
+- Déployer des VM Ubuntu et tester la connectivité HTTP et SSH depuis différents réseaux.
+- Différencier un problème de routage, un blocage NSG, un problème DNS et une erreur RBAC.
+- Utiliser l'**identité managée affectée par le système** d'une VM dans Python pour écrire dans Azure Table Storage **sans clé de compte ni chaîne de connexion**.
+- Interroger Table Storage avec Azure CLI depuis le **PC local** et **VM-Client**, avec des identités différentes.
+- Désactiver l'accès réseau public au stockage et rétablir l'accès privé via **Private Endpoint** et **Private DNS**.
+- Valider le flux de bout en bout et nettoyer les ressources.
+
+## 2. Architecture et conventions de nommage
+
+Utilisez des noms uniques lorsque Azure l'exige. Notez vos valeurs réelles ; les commandes utilisent des paramètres tels que `<STORAGE_ACCOUNT>`.
+
+| Ressource | Nom proposé | Adresse / rôle |
+|---|---|---|
+| Groupe de ressources | `rg-private-lab` | Même région Azure pour toutes les ressources |
+| VNet-App | `vnet-app` | `10.10.0.0/16` |
+| Sous-réseau applicatif | `snet-app` | `10.10.1.0/24` |
+| Sous-réseau Private Endpoint | `snet-private-endpoints` | `10.10.2.0/24` |
+| VNet-Client | `vnet-client` | `10.20.0.0/16` |
+| Sous-réseau client | `snet-client` | `10.20.1.0/24` |
+| VM applicative | `vm-app` | Ubuntu 24.04, IP privée dans `10.10.1.0/24` |
+| VM cliente | `vm-client` | Ubuntu 24.04, IP privée dans `10.20.1.0/24` |
+| NSG applicatif | `nsg-app` | SSH 22 et HTTP 5000 temporaire |
+| NSG client | `nsg-client` | SSH 22 depuis l'IP publique de l'étudiant |
+| Compte de stockage | `st<uniquelettersnumbers>` | Standard GPv2 ; nom globalement unique, 3 à 24 lettres minuscules/chiffres |
+| Table | `Calculations` | Données Azure Table Storage |
+| Private Endpoint Storage | `pe-storage-table` | Sous-ressource Storage **table** |
+| Zone DNS privée | `privatelink.table.core.windows.net` | Liée aux deux VNets |
+
+**Chemin réseau final :**
 
 ```text
-PC local / Postman (test public initial)
-   | HTTPS 443 (avant restriction)
-   v
-Azure Function App (la MÊME application durant tout le TP)
-   | accès entrant public au départ, puis Private Endpoint
-   | VNet Integration sortante -> snet-func-integration
-   |
-VNet-App 10.10.0.0/16
-   snet-func-integration 10.10.1.0/27 (délégué, trafic sortant)
-   snet-private-endpoints  10.10.2.0/24
-      - Private Endpoint Function : sites
-      - Private Endpoint Table Storage : table (plus tard)
-   |
-   | VNet peering (créé plus tard ; insuffisant à lui seul)
-   |
-VNet-Client 10.20.0.0/16
-   snet-vm 10.20.1.0/24
-      - VM Ubuntu avec IP publique pour SSH depuis votre IP
+PC étudiant --SSH--> VM-Client (IP publique)
+                          |
+                          | curl / SSH via VNet Peering (IP privées)
+                          v
+                       VM-App ---- API Python Flask :5000
+                          |
+                          | ManagedIdentityCredential (authentification)
+                          | Azure RBAC : Storage Table Data Contributor (autorisation)
+                          | HTTPS vers <STORAGE_ACCOUNT>.table.core.windows.net
+                          v
+                  Private Endpoint Storage (IP privée)
+                          |
+                          v
+                  Azure Table Storage / Calculations
 
-Storage Account de données -> Table « Calculations »
-Storage Account runtime -> utilisé en interne par Azure Functions
+PC étudiant -- Azure CLI --> Point d'accès public Storage : BLOQUÉ à la fin
+VM-Client -- Azure CLI / Identité managée --> Private Endpoint Storage : AUTORISÉ
 ```
 
-### Nommage des ressources
+**À retenir :** l'identité managée est un mécanisme d'**authentification**, pas un saut réseau. Le Private Endpoint et le DNS privé assurent la connectivité privée. **VM-App n'a pas besoin de Private Endpoint** : son IP privée est directement accessible depuis le VNet appairé.
 
-Choisissez un suffixe unique, par exemple `ab12`, et réutilisez-le. Remplacez les noms ci-dessous par les vôtres.
+### Prérequis
 
-| Ressource | Nom proposé |
-|---|---|
-| Resource Group | `rg-az-securelab-ab12` |
-| VNet-App | `vnet-app-ab12` |
-| Subnet d'intégration Function | `snet-func-integration` |
-| Subnet des Private Endpoints | `snet-private-endpoints` |
-| VNet-Client | `vnet-client-ab12` |
-| Subnet VM | `snet-vm` |
-| NSG du subnet VM | `nsg-vm-ab12` |
-| Function App | `func-calc-ab12` (nom globalement unique) |
-| Storage Account runtime | `stfuncrt<unique>` (nom globalement unique) |
-| Storage Account de données | `stcalc<unique>` (nom globalement unique) |
-| Ubuntu VM | `vm-client-ab12` |
-| Private Endpoint Function | `pe-func-ab12` |
-| Private Endpoint Table | `pe-table-ab12` |
-
-**Prérequis :** abonnement Azure actif ; autorisations de créer des ressources **et d'attribuer des rôles** (par exemple `Owner`, ou permissions RBAC équivalentes incluant la gestion des rôles) ; adresse IPv4 publique du poste ; SSH et éventuellement PowerShell/Postman ; outils Python 3.12, Azure CLI et Functions Core Tools v4 installés ensuite sur Ubuntu. Le plan d'hébergement Function et la taille de VM doivent être disponibles dans votre région et votre abonnement.
-
-**Coûts :** VM, IP publique, Private Endpoints, Storage et Function App peuvent être facturés. Supprimez les ressources à la fin du TP.
-
-### Questions de départ
-
-- Quels services relèvent de **IaaS**, **PaaS** ou **serverless** ? Qui maintient l'OS Ubuntu ? Qui gère le runtime Azure Functions ?
-- Quelles différences entre **VNet**, **subnet**, **NSG**, **Private Endpoint** et **VNet peering** ?
-- Autoriser uniquement le port SSH 22 **en inbound** bloque-t-il le HTTPS 443 **en outbound** ? **Non** : les NSG Azure possèdent des règles outbound autorisant le trafic par défaut. Nous les examinerons sans ajouter de règle HTTPS personnalisée.
+- Un abonnement Azure autorisant la création de VM, VNets, NSG, Storage, Private Endpoints, DNS privé et attributions de rôles. Pour attribuer des rôles, il faut `Owner`, `User Access Administrator` ou une permission équivalente ; `Contributor` seul ne suffit pas.
+- Une région disposant d'un quota pour deux petites VM Ubuntu. Les VM et le Private Endpoint ne sont pas nécessairement gratuits.
+- Un PC Windows avec **PowerShell**, un **client SSH** (`ssh -V`), **Azure CLI** (`az version`) et Internet. Si Azure CLI manque : [guide officiel Microsoft](https://learn.microsoft.com/fr-fr/cli/azure/install-azure-cli-windows).
+- Votre adresse IPv4 publique, consultable sur `https://api.ipify.org`. Notez-la sous `<MY_PUBLIC_IP>`.
+- Un terminal et le portail `https://portal.azure.com`.
+- Notez les **vraies** IP, le nom d'utilisateur des VM et le nom du compte Storage. Remplacez les paramètres entre chevrons : ne saisissez pas littéralement `<` et `>`.
 
 ---
 
-## 1. Créer les ressources applicatives Azure (40 min)
+## 3. Phase A — Déployer VNet-App et VM-App
 
-### 1.1 Créer le Resource Group
+### Étape A1 — Créer le groupe de ressources et VNet-App
 
-1. **Azure Portal → Resource groups → + Create**.
-2. **Subscription** : sélectionnez l'abonnement du TP.
-3. **Resource group** : `rg-az-securelab-ab12`.
-4. **Region** : choisissez une région prenant en charge **Flex Consumption**, **Private Endpoints** et la taille de VM retenue ; conservez la même région pour les ressources.
-5. **Review + create → Create**.
+1. **Portail Azure → Groupes de ressources → Créer**. Nom : `rg-private-lab`. Choisissez votre région, puis **Vérifier + créer → Créer**.
+2. **Réseaux virtuels → Créer**. Nom : `vnet-app`, groupe `rg-private-lab`, même région.
+3. Dans **Adresses IP**, définissez `10.10.0.0/16`, puis créez `snet-app` (`10.10.1.0/24`) et `snet-private-endpoints` (`10.10.2.0/24`). Supprimez ou adaptez le sous-réseau par défaut si nécessaire.
+4. **Vérifier + créer → Créer**.
 
-**Concept — Resource Group :** conteneur logique de gestion des ressources Azure. Ce n'est pas, à lui seul, une frontière d'isolation réseau ou de sécurité.
+### Étape A2 — Créer VM-App
 
-### 1.2 Créer deux Storage Accounts
+1. **Machines virtuelles → Créer → Machine virtuelle Azure**.
+2. Groupe `rg-private-lab` ; nom `vm-app` ; image **Ubuntu Server 24.04 LTS** ; plus petite taille autorisée avec suffisamment de mémoire (par exemple série B si disponible).
+3. Authentification : **Clé publique SSH** ; utilisateur `azureuser`. Générez/téléchargez une paire de clés ou utilisez une clé publique existante. **Conservez la clé privée en sécurité sur votre PC**.
+4. Onglet **Mise en réseau** : VNet `vnet-app`, sous-réseau `snet-app`, **IP publique : créer** ; NSG de carte réseau **De base ou Avancé** (`nsg-app` en mode avancé). Autorisez **SSH (22)** uniquement depuis `<MY_PUBLIC_IP>/32`, et non depuis tout Internet. Si l'assistant crée déjà un NSG, réutilisez-le au lieu d'en multiplier inutilement.
+5. Dans **Gestion → Identité** (ou après déploiement : **VM-App → Identité → Affectée par le système → Activé → Enregistrer**), activez l'**identité managée affectée par le système**.
+6. Créez la VM. Notez `<APP_PUBLIC_IP>` et `<APP_PRIVATE_IP>` depuis **VM-App → Vue d'ensemble / Mise en réseau**.
+7. Vérifiez que la source de la règle SSH entrante est bien votre IPv4 publique `/32`. Si l'assistant a créé `AllowSSH` depuis `Any`, restreignez-la.
 
-1. **Azure Portal → Storage accounts → + Create**.
-2. Choisissez votre Resource Group, la région, la performance **Standard** et la redondance **LRS** pour ce TP.
-3. Créez `stfuncrt<unique>` : Storage Account du **runtime** Azure Functions. Conservez son accès réseau public pendant le TP ; ce n'est pas le compte que nous sécuriserons dans l'exercice Table Storage.
-4. **Review + create → Create**.
-5. Recommencez avec `stcalc<unique>` : Storage Account des **données applicatives**. Sélectionnez initialement **Public network access: Enabled from all networks**.
-6. Ouvrez **Storage Account de données → Data storage → Tables → + Table** ; créez `Calculations` (respectez la casse).
-7. Dans **Storage Account de données → Networking**, vérifiez que l'accès public est encore autorisé.
+### Étape A3 — Se connecter en SSH et installer les prérequis de VM-App
 
-**Concept — Storage :** un Storage Account peut proposer plusieurs services (`blob`, `queue`, `table`, `file`), chacun ayant son endpoint. Un Private Endpoint `blob` ne donne pas accès au service `table`.
+Sur le **PC local** (PowerShell), remplacez le chemin de clé et l'IP :
 
-### 1.3 Créer VNet-App et ses subnets
-
-1. **Azure Portal → Virtual networks → + Create**.
-2. **Name** : `vnet-app-ab12` ; Resource Group du TP ; région identique.
-3. Onglet **IP addresses** → Address space `10.10.0.0/16`.
-4. Ajoutez `snet-func-integration` : `10.10.1.0/27`. Pour **Subnet delegation**, sélectionnez **Microsoft.App/environments** si cette délégation est proposée/requise par **Flex Consumption**. **Ne placez pas les Private Endpoints dans ce subnet délégué.**
-5. Ajoutez `snet-private-endpoints` : `10.10.2.0/24`, sans délégation.
-6. Créez le VNet.
-
-> Si l'assistant Flex Consumption propose de créer ou de déléguer automatiquement le subnet d'intégration, vous pouvez utiliser cette option, puis vérifier sa présence dans `vnet-app-ab12`. Les écrans du Portal évoluent.
-
-### 1.4 Créer la Function App (une seule fois)
-
-1. **Azure Portal → Function App → + Create**.
-2. Choisissez **Flex Consumption** (ou un autre plan validé par le formateur qui prend en charge **VNet Integration** et **Private Endpoint**).
-3. **Basics** : Subscription, Resource Group, nom unique, **Runtime stack: Python**, **Python version: 3.12** (version utilisée et validée pendant le TP), Region.
-4. **Storage** : sélectionnez `stfuncrt<unique>` comme Storage Account du runtime ; ne sélectionnez pas le compte de données applicatives.
-5. **Networking** : laissez l'accès public entrant activé. Configurez la **VNet Integration sortante** vers `vnet-app-ab12` / `snet-func-integration` si l'assistant le propose. Sinon, faites-le après la création.
-6. **Review + create → Create**.
-7. **Function App → Networking → Virtual network integration** : vérifiez l'association à VNet-App et à son subnet d'intégration ; sinon, utilisez **Add VNet / Configure**.
-8. **Function App → Networking → Public network access** : vérifiez **Enabled**.
-
-**Concept essentiel :** **VNet Integration** concerne principalement le trafic **sortant** de la Function App. Elle ne rend pas l'API privée en entrée. Nous utiliserons ensuite un **Private Endpoint** pour les appels HTTP entrants.
-
-### 1.5 Comprendre les Managed Identities AVANT leur configuration
-
-Une **Managed Identity** est une identité Microsoft Entra ID associée à une ressource Azure. Azure gère les identifiants et leur rotation : l'application obtient des tokens sans stocker de mot de passe ni de clé Storage.
-
-- **System-assigned Managed Identity** : liée à une seule ressource, supprimée avec elle.
-- **User-assigned Managed Identity** : ressource Azure indépendante, réutilisable par plusieurs services.
-
-Créer une identité **n'accorde aucune permission automatiquement**. Il faut attribuer un rôle **Azure RBAC** adapté au bon périmètre (**scope**). Distinguez **authentication** (qui êtes-vous ?), **authorization** (que pouvez-vous faire ?) et **network connectivity** (pouvez-vous joindre le service ?).
-
-**Questions :** une Function avec Managed Identity, mais sans rôle Storage data-plane, peut-elle écrire une entité ? Le rôle générique `Contributor` sur un Resource Group suffit-il à accéder aux données Table ?
-
-### 1.6 Activer l'identité de la Function et attribuer le rôle Table
-
-1. **Function App → Identity → System assigned**.
-2. **Status: On → Save**. Vérifiez l'apparition de l'**Object (principal) ID**.
-3. **Storage Account de données → Access control (IAM) → + Add → Add role assignment**.
-4. Sélectionnez **Storage Table Data Contributor** (et non le rôle générique `Contributor`).
-5. **Members → Assign access to: Managed identity → + Select members**.
-6. Type **Function App** ; choisissez votre Function App → **Review + assign**.
-7. **Function App → Settings → Environment variables → App settings → + Add** (ou **Configuration → Application settings**, selon l'interface).
-8. **Name** : `DATA_STORAGE_ACCOUNT` ; **Value** : le **nom seul** du Storage Account de données, **sans `https://` et sans nom de domaine**. Appliquez et enregistrez ; acceptez le redémarrage si demandé.
-9. Attendez quelques minutes pour la propagation des permissions RBAC.
-
----
-
-## 2. Créer VNet-Client et la VM Ubuntu (30 min)
-
-### 2.1 Créer le VNet client
-
-1. **Azure Portal → Virtual networks → + Create**.
-2. **Name** : `vnet-client-ab12` ; Address space `10.20.0.0/16`.
-3. **IP addresses → Add subnet** : `snet-vm`, `10.20.1.0/24`.
-4. **Review + create → Create**. **Ne créez pas encore le peering.**
-
-### 2.2 Créer le NSG du subnet VM
-
-1. **Azure Portal → Network security groups → + Create** ; nom `nsg-vm-ab12`.
-2. **nsg-vm-ab12 → Inbound security rules → + Add**.
-3. **Source: IP Addresses** → votre IPv4 publique actuelle en `/32` ; **Destination: Any** ; **Service: SSH** ou TCP/22 ; **Action: Allow** ; **Priority: 100** ; **Name: Allow-SSH-MyIP**.
-4. Vérifiez qu'aucune règle inbound personnalisée n'ouvre les ports 80/443 vers la VM.
-5. **Virtual networks → vnet-client-ab12 → Subnets → snet-vm → Network security group** → sélectionnez `nsg-vm-ab12` → **Save**.
-6. Consultez **nsg-vm-ab12 → Outbound security rules** : repérez `AllowInternetOutBound` et `AllowVnetOutBound`. **N'ajoutez aucune règle HTTPS outbound personnalisée.**
-
-**Concept — NSG :** les règles sont évaluées par ordre de priorité (nombre le plus faible d'abord), séparément en **inbound** et **outbound**. Les NSG sont **stateful**. Autoriser uniquement SSH en entrée ne bloque pas HTTPS en sortie.
-
-### 2.3 Déployer Ubuntu
-
-1. **Azure Portal → Virtual machines → + Create → Azure virtual machine**.
-2. Resource Group du TP ; **VM name** : `vm-client-ab12` ; **Image: Ubuntu Server 24.04 LTS** ; **Size** : petit SKU validé par le formateur (par exemple B1s si disponible).
-3. **Authentication: SSH public key** ; **Username: azureuser**. Générez/téléchargez une paire de clés ou utilisez votre clé publique existante. **Ne partagez jamais la clé privée.**
-4. Onglet **Networking** : **Virtual network** `vnet-client-ab12` ; **Subnet** `snet-vm` ; **Public IP: Enabled** pour SSH ; **NIC network security group: None**, car le NSG est déjà associé au subnet. Si un NSG NIC est imposé, vérifiez qu'il ne contredit pas les règles du TP.
-5. **Review + create → Create**.
-6. **VM → Overview → Public IP address** ; depuis votre PC, ouvrez une connexion SSH :
-
-```bash
-ssh -i ~/.ssh/<PRIVATE_KEY_FILE> azureuser@<VM_PUBLIC_IP>
+```powershell
+ssh -i "$HOME\.ssh\<YOUR_PRIVATE_KEY>" azureuser@<APP_PUBLIC_IP>
 ```
 
-7. Dans Ubuntu :
+Sur **VM-App** :
 
 ```bash
-sudo apt-get update
-sudo apt-get install -y curl dnsutils jq
-ip -4 addr
-ip route
-```
-
-**Point de contrôle :** SSH fonctionne ; la VM est dans VNet-Client ; aucun peering n'existe encore. La VM pourra toutefois contacter l'API **publique** via Internet. Ce n'est pas contradictoire avec l'absence de peering.
-
-### 2.4 Ubuntu : poste de développement et de test
-
-Nous allons créer les fichiers et publier le code **directement depuis la VM Ubuntu**, et non depuis Windows. Au début, Ubuntu utilise son accès Internet public pour joindre Azure et la Function App. Le peering n'est pas encore configuré.
-
-### 2.5 Installer les outils, créer les fichiers Python et publier
-
-Exécutez les commandes **une par une**. Conservez **Python 3.12**.
-
-```bash
-sudo apt-get update
-sudo apt-get install -y python3.12 python3.12-venv python3-pip curl ca-certificates gnupg dnsutils jq git
+sudo apt update
+sudo apt install -y python3.12 python3-pip python3.12-venv curl dnsutils openssh-client
 python3.12 --version
+mkdir -p ~/calculator-api
+cd ~/calculator-api
+python3.12 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install flask azure-identity azure-data-tables
 ```
 
-**Installer Azure CLI** (méthode utilisée pendant le TP) :
+**N'utilisez pas** `sudo pip install` dans le Python système d'Ubuntu. Utilisez l'environnement virtuel.
+
+---
+
+## 4. Phase B — Créer un Storage public et configurer l'identité managée
+
+### Étape B1 — Créer le compte Storage et la table
+
+1. **Comptes de stockage → Créer**. Groupe `rg-private-lab`, même région, nom globalement unique `<STORAGE_ACCOUNT>`, performance **Standard**, type **StorageV2 (usage général v2)**, redondance **LRS**.
+2. **Mise en réseau : activer l'accès réseau public depuis tous les réseaux** pour les premiers tests. Conservez **Transfert sécurisé requis**.
+3. Créez le compte de stockage.
+4. **Compte de stockage → Stockage des données → Tables → + Table**. Nom exact : **`Calculations`** (C majuscule). Créez la table. Sans elle, vous obtiendrez `TableNotFound`.
+5. Notez le **nom** du compte, pas son URL complète.
+
+### Étape B2 — Autoriser VM-App à écrire
+
+1. **Compte Storage → Contrôle d'accès (IAM) → Ajouter → Ajouter une attribution de rôle**.
+2. Sélectionnez **Storage Table Data Contributor** (et non le rôle générique `Contributor`).
+3. **Membres → Attribuer l'accès à : Identité managée → Sélectionner les membres → Machine virtuelle → `vm-app`**.
+4. **Vérifier + attribuer**. Attendez quelques minutes pour la propagation RBAC.
+5. Sur VM-App, Flask utilise directement `ManagedIdentityCredential()`. **Aucun `az login` n'est nécessaire pour l'application Python**.
+
+> Pour les futurs tests Azure CLI depuis le PC, attribuez aussi **Storage Table Data Reader** à votre utilisateur Azure. Les permissions de gestion du portail ne donnent pas automatiquement accès aux données des tables. Vous devez disposer des droits nécessaires pour attribuer ce rôle.
+
+### Étape B3 — Créer l'application Flask complète sur VM-App
+
+Sur **VM-App**, créez le fichier :
 
 ```bash
-curl -fsSL 'https://azurecliprod.blob.core.windows.net/$root/deb_install.sh' | sudo bash
-az version
+cd ~/calculator-api
+nano app.py
 ```
 
-> Cette commande exécute un script téléchargé avec les droits root. Utilisez-la uniquement dans un environnement de TP approuvé ; en production, privilégiez la procédure officielle avec vérification du dépôt et des packages.
-
-**Installer Node.js 22, npm et Azure Functions Core Tools v4** :
-
-```bash
-curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
-sudo apt-get install -y nodejs
-node --version
-npm --version
-sudo npm install -g azure-functions-core-tools@4 --unsafe-perm
-func --version
-```
-
-**Dépannage validé :** Node.js **18** ne satisfait pas les prérequis de l'installateur npm de Core Tools **4.15.2** (Node >=22). Si `func --version` affiche `Permission denied` et que `/usr/bin/func` pointe vers un `main.js` non exécutable, vérifiez le chemin avant de corriger **uniquement ce problème** :
-
-```bash
-readlink -f /usr/bin/func
-ls -l "$(readlink -f /usr/bin/func)"
-sudo chmod +x "$(readlink -f /usr/bin/func)"
-func --version
-```
-
-**Se connecter à Azure avec son compte utilisateur pour publier l'application :**
-
-```bash
-az login --use-device-code
-az account show --output table
-```
-
-Si plusieurs abonnements sont disponibles : `az account set --subscription '<SUBSCRIPTION_ID>'`.
-
-**Créer manuellement les fichiers dans Ubuntu** (aucun transfert depuis le PC nécessaire) :
-
-```bash
-mkdir -p ~/functionapp
-cd ~/functionapp
-nano function_app.py
-```
-
-Collez **l'intégralité du code ci-dessous** ; enregistrez avec `Ctrl+O`, Entrée, puis quittez avec `Ctrl+X`.
+Collez le code Python 3.12 complet ci-dessous. **Les noms des champs JSON, les routes et les messages techniques restent en anglais pour conserver les mêmes commandes de test que la version anglaise.**
 
 ```python
-"""Azure Functions Python v2: calculation API backed by Azure Table Storage."""
-import json
 import logging
 import os
+import time
 import uuid
 from datetime import datetime, timezone
 
-import azure.functions as func
 from azure.core.exceptions import AzureError
-from azure.data.tables import TableClient
-from azure.identity import DefaultAzureCredential
+from azure.data.tables import TableServiceClient
+from azure.identity import ManagedIdentityCredential
+from flask import Flask, jsonify, request
 
-app = func.FunctionApp(http_auth_level=func.AuthLevel.FUNCTION)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+)
+logger = logging.getLogger("calculator-api")
+logging.getLogger("azure").setLevel(logging.WARNING)
+
+app = Flask(__name__)
+
+STORAGE_ACCOUNT_NAME = os.environ.get("STORAGE_ACCOUNT_NAME", "").strip()
+TABLE_NAME = os.environ.get("TABLE_NAME", "Calculations").strip()
+
+if not STORAGE_ACCOUNT_NAME:
+    raise RuntimeError("STORAGE_ACCOUNT_NAME must be set to the storage account NAME")
+
+endpoint = f"https://{STORAGE_ACCOUNT_NAME}.table.core.windows.net"
+credential = ManagedIdentityCredential()
+table_client = TableServiceClient(
+    endpoint=endpoint, credential=credential
+).get_table_client(table_name=TABLE_NAME)
+
+logger.info("Storage account: %s", STORAGE_ACCOUNT_NAME)
+logger.info("Table: %s", TABLE_NAME)
+logger.info("Endpoint: %s", endpoint)
+logger.info("Authentication: VM system-assigned Managed Identity")
 
 
-@app.route(route="calculate", methods=["POST"])
-def calculate(req: func.HttpRequest) -> func.HttpResponse:
-    try:
-        payload = req.get_json()
-        if not isinstance(payload, dict):
-            raise ValueError("JSON object required")
-        a, b = payload["a"], payload["b"]
-        operation = payload.get("operation", "add")
-        if type(a) not in (int, float) or type(b) not in (int, float):
-            raise ValueError("a and b must be numeric")
-        if operation not in {"add", "subtract", "multiply", "divide"}:
-            raise ValueError("operation must be add, subtract, multiply or divide")
-        if operation == "divide" and b == 0:
-            raise ValueError("division by zero")
-        result = {"add": lambda: a + b, "subtract": lambda: a - b,
-                  "multiply": lambda: a * b, "divide": lambda: a / b}[operation]()
-    except (ValueError, KeyError, TypeError) as exc:
-        return func.HttpResponse(json.dumps({"error": str(exc)}), status_code=400,
-                                 mimetype="application/json")
+@app.get("/health")
+def health():
+    return jsonify(status="ok", service="calculator-api")
 
-    account = os.getenv("DATA_STORAGE_ACCOUNT")
-    if not account:
-        return func.HttpResponse('{"error":"DATA_STORAGE_ACCOUNT setting missing"}',
-                                 status_code=500, mimetype="application/json")
+
+@app.post("/api/calculate")
+def calculate():
+    request_id = uuid.uuid4().hex[:8]
+    started = time.monotonic()
+    logger.info("[%s] POST /api/calculate from %s", request_id, request.remote_addr)
+
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify(error="Expected a JSON object", requestId=request_id), 400
+
+    operation = payload.get("operation")
+    a = payload.get("a")
+    b = payload.get("b")
+
+    if operation not in ("add", "subtract", "multiply", "divide"):
+        return jsonify(error="Invalid operation", requestId=request_id), 400
+    if (isinstance(a, bool) or isinstance(b, bool)
+            or not isinstance(a, (int, float))
+            or not isinstance(b, (int, float))):
+        return jsonify(error="a and b must be numbers", requestId=request_id), 400
+    if operation == "divide" and b == 0:
+        return jsonify(error="Cannot divide by zero", requestId=request_id), 400
+
+    operations = {
+        "add": lambda x, y: x + y,
+        "subtract": lambda x, y: x - y,
+        "multiply": lambda x, y: x * y,
+        "divide": lambda x, y: x / y,
+    }
+    result = operations[operation](a, b)
+    logger.info("[%s] Calculated %s(%s, %s) = %s", request_id, operation, a, b, result)
+
+    row_key = str(uuid.uuid4())
     entity = {
-        "PartitionKey": "calculations", "RowKey": str(uuid.uuid4()),
-        "Operation": operation, "A": float(a), "B": float(b),
-        "Result": float(result), "CreatedAt": datetime.now(timezone.utc).isoformat()
+        "PartitionKey": "calculations",
+        "RowKey": row_key,
+        "Operation": operation,
+        "A": a,
+        "B": b,
+        "Result": result,
+        "CreatedAt": datetime.now(timezone.utc).isoformat(),
     }
+
     try:
-        with TableClient(
-            endpoint=f"https://{account}.table.core.windows.net",
-            table_name="Calculations",
-            credential=DefaultAzureCredential(exclude_interactive_browser_credential=True),
-        ) as table:
-            table.create_entity(entity)
+        logger.info("[%s] Writing to %s / %s using Managed Identity", request_id, endpoint, TABLE_NAME)
+        table_client.create_entity(entity=entity)
     except AzureError:
-        logging.exception("Table Storage write failed")
-        return func.HttpResponse('{"error":"Table Storage write failed"}',
-                                 status_code=502, mimetype="application/json")
-    return func.HttpResponse(json.dumps({
-        "operation": operation, "a": a, "b": b, "result": result,
-        "rowKey": entity["RowKey"], "status": "stored"
-    }), status_code=200, mimetype="application/json")
+        logger.exception("[%s] Azure Table Storage write failed", request_id)
+        return jsonify(error="Azure Table Storage operation failed", requestId=request_id), 502
+
+    logger.info("[%s] Stored row %s in %.1f ms", request_id, row_key,
+                (time.monotonic() - started) * 1000)
+    return jsonify(
+        operation=operation, a=a, b=b, result=result,
+        status="stored", rowKey=row_key, requestId=request_id,
+    ), 200
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000, debug=False)
 ```
 
-Créer `requirements.txt` :
+Définissez la variable avec le **nom réel** du compte Storage, pas son URL :
 
 ```bash
-nano requirements.txt
+export STORAGE_ACCOUNT_NAME="<STORAGE_ACCOUNT>"
+export TABLE_NAME="Calculations"
+source ~/calculator-api/.venv/bin/activate
+python ~/calculator-api/app.py
 ```
 
-```text
-azure-functions
-azure-identity
-azure-data-tables
-```
-
-Créer `host.json` :
+Gardez ce terminal ouvert pour les premiers tests. Dans une **deuxième session SSH** vers VM-App :
 
 ```bash
-nano host.json
-```
-
-```json
-{
-  "version": "2.0",
-  "logging": {
-    "applicationInsights": {
-      "samplingSettings": { "isEnabled": true, "excludedTypes": "Request" }
-    }
-  }
-}
-```
-
-**Facultatif :** créer un environnement virtuel Python 3.12 pour vérifier le code localement (le déploiement utilise le runtime distant) :
-
-```bash
-python3.12 -m venv .venv
-source .venv/bin/activate
-python -m pip install -r requirements.txt
-python -m py_compile function_app.py
-```
-
-**Publier vers la Function App EXISTANTE, sans en créer une nouvelle :**
-
-```bash
-func azure functionapp publish '<EXISTING_FUNCTION_APP_NAME>' --python
-```
-
-**Azure Portal → Function App → Functions** : vérifiez que `calculate` apparaît. Publiez le code **avant de désactiver l'accès public**. Un déploiement réussi ne garantit pas que la Function peut écrire dans Storage : il faut tester l'API et la table.
-
-> **Erreur réellement rencontrée :** `DATA_STORAGE_ACCOUNT` doit contenir **uniquement le nom du compte** (ex. `stcalcatb`), **pas** `https://stcalcatb.table.core.windows.net`. Le code construit lui-même l'URL complète. Une URL dans cette variable a provoqué HTTP 502 côté Function et `InvalidResourceName` / HTTP 400 côté Storage.
-
-### 2.6 Tester l'API publique depuis le PC ET depuis Ubuntu
-
-1. **Azure Portal → Function App → Functions → calculate → Get function URL**.
-2. Récupérez l'URL et sa **Function key** (paramètre `code=` ou header `x-functions-key`). **Traitez cette clé comme un secret ; ne la partagez pas.**
-3. Sur Windows PowerShell :
-
-```powershell
-$uri = 'https://<FUNCTION_APP_NAME>.azurewebsites.net/api/calculate'
-$key = '<FUNCTION_KEY>'
-$body = @{ operation = 'multiply'; a = 12; b = 8 } | ConvertTo-Json
-Invoke-RestMethod -Uri $uri -Method Post -Headers @{ 'x-functions-key' = $key } -ContentType 'application/json' -Body $body
-```
-
-4. Depuis Ubuntu avec `curl` :
-
-```bash
-curl -i -X POST 'https://<FUNCTION_APP_NAME>.azurewebsites.net/api/calculate' \
-  -H 'Content-Type: application/json' -H 'x-functions-key: <FUNCTION_KEY>' \
-  -d '{"operation":"multiply","a":12,"b":8}'
-```
-
-5. Répétez le test depuis **Ubuntu** tant que la Function App est publique. Il doit réussir **sans peering**, grâce à l'accès Internet sortant de la VM.
-6. Avec **Postman** : méthode **POST** ; URL `https://<FUNCTION_APP_NAME>.azurewebsites.net/api/calculate` ; headers `Content-Type: application/json` et `x-functions-key: <FUNCTION_KEY>` ; **Body → raw → JSON** avec la même charge utile.
-7. **Résultat attendu :** HTTP **200**, `result: 96`, `status: stored` et un `rowKey`.
-8. **Storage Account de données → Storage browser → Tables → Calculations** : retrouvez la nouvelle entité. Si HTTP 502 apparaît, contrôlez la Managed Identity, le rôle RBAC, `DATA_STORAGE_ACCOUNT`, le nom de la table et les logs.
-
-**Point de contrôle 1 :** démontrer un appel API réussi depuis le PC et depuis Ubuntu, puis retrouver l'entité dans Table Storage.
-
----
-
-## 3. Rendre privée la Function App existante (30 min)
-
-### 3.1 Créer le Private Endpoint entrant
-
-1. **Function App → Networking → Private endpoint connections → + Add / Create** (ou **Private endpoints → + Create**, selon l'interface).
-2. **Name** : `pe-func-ab12`.
-3. **Resource** : votre Function App **existante** ; **Target subresource: `sites`**.
-4. **Virtual network** : `vnet-app-ab12` ; **Subnet** : `snet-private-endpoints`.
-5. **DNS integration** : **Yes** ; zone **`privatelink.azurewebsites.net`** ; créez-la si nécessaire.
-6. Validez ; attendez le statut **Approved**.
-7. **Private Endpoint → Overview → Network interface** : relevez l'IP privée, par exemple `10.10.2.x`.
-8. **Private DNS zones → privatelink.azurewebsites.net → Virtual network links** : vérifiez le lien vers VNet-App et la présence de l'enregistrement **A**.
-
-### 3.2 Désactiver l'accès public entrant
-
-1. **Function App → Networking → Public network access** (ou **Inbound traffic configuration → Public network access**).
-2. Sélectionnez **Disabled → Save**.
-3. Depuis votre **PC**, répétez le POST : **échec attendu** (souvent HTTP 403, selon le contexte).
-4. Depuis **Ubuntu**, lancez :
-
-```bash
-nslookup <FUNCTION_APP_NAME>.azurewebsites.net
-curl -v --connect-timeout 5 https://<FUNCTION_APP_NAME>.azurewebsites.net/api/calculate
-```
-
-**Résultat attendu :** Ubuntu n'a pas encore de chemin privé vers la Function. Le nom peut toujours résoudre vers une IP publique, car VNet-Client n'est pas encore lié à la zone Private DNS. Le `GET` utilisé ici sert à observer la connexion ; le test applicatif complet utilisera `POST`.
-
-**Questions :** VNet Integration suffit-elle pour l'accès HTTP entrant ? Quelle IP est retournée par DNS ? Pourquoi un Private Endpoint n'est-il pas équivalent à un VNet peering ?
-
----
-
-## 4. Connecter les VNets avec VNet peering et Private DNS (20 min)
-
-### 4.1 Comprendre VNet peering
-
-Le **VNet peering** permet le routage IP privé entre deux VNets Azure dont les espaces d'adressage ne se chevauchent pas. Il ne crée ni Private Endpoint ni configuration DNS et ne contourne pas les NSG.
-
-Dans notre TP, les **règles NSG par défaut** autorisent normalement le trafic entre VNets peered. **Aucune règle HTTPS inbound/outbound supplémentaire n'est nécessaire.**
-
-Avant de poursuivre, vérifiez que le Private Endpoint de la Function est **Approved** et relevez son IP.
-
-### 4.2 Créer le VNet peering depuis le Portal
-
-1. **Virtual networks → vnet-client-ab12 → Peerings → + Add**.
-2. **This virtual network peering link name** : `client-to-app`.
-3. **Remote virtual network** : `vnet-app-ab12`.
-4. Si demandé, **Remote virtual network peering link name** : `app-to-client`.
-5. Conservez **Allow virtual network access** activé dans les deux sens. Ni **Gateway transit** ni **Forwarded traffic** ne sont nécessaires.
-6. **Add**. Vérifiez l'état **Connected** des deux côtés, dans **Virtual networks → Peerings**.
-7. **Network security groups → nsg-vm-ab12 → Outbound security rules** : repérez **AllowVnetOutBound**, priorité **65000**. **N'ajoutez pas de règle HTTPS personnalisée.**
-
-**Question :** pourquoi la VM peut-elle communiquer avec VNet-App alors que nous avons uniquement ouvert SSH en inbound ?
-
-### 4.3 Associer la zone Private DNS au VNet client
-
-Le peering fournit le **chemin réseau**, mais Ubuntu doit aussi résoudre le nom de la Function App vers l'**IP du Private Endpoint**, et non vers une IP publique.
-
-1. **Private DNS zones → privatelink.azurewebsites.net**.
-2. **Virtual network links → + Add**.
-3. **Link name** : `link-client-function`.
-4. **Virtual network** : `vnet-client-ab12`.
-5. **Enable auto registration: No → Create / OK**.
-6. **Private DNS zones → privatelink.azurewebsites.net → Recordsets** : vérifiez l'enregistrement **A** de la Function App pointant vers `10.10.2.x`.
-7. Depuis Ubuntu :
-
-```bash
-nslookup <FUNCTION_APP_NAME>.azurewebsites.net
-getent ahostsv4 <FUNCTION_APP_NAME>.azurewebsites.net
-```
-
-**Résultat attendu :** le nom public de la Function App passe par un **CNAME** vers `*.privatelink.azurewebsites.net`, puis se résout vers l'IP privée `10.10.2.x`.
-
-> **Erreur rencontrée pendant le TP :** `nslookup` et `getent` prennent un **hostname**, pas une URL. Utilisez `nslookup monapp.azurewebsites.net`, **sans `https://`**. En revanche, `curl` utilise une URL avec `https://`.
-
-### 4.4 Appeler la même Function App en privé
-
-Depuis Ubuntu :
-
-```bash
-curl -v --connect-timeout 5 -X POST \
-  'https://<FUNCTION_APP_NAME>.azurewebsites.net/api/calculate' \
+curl -i http://127.0.0.1:5000/health
+curl -i -X POST http://127.0.0.1:5000/api/calculate \
   -H 'Content-Type: application/json' \
-  -H 'x-functions-key: <FUNCTION_KEY>' \
-  -d '{"operation":"add","a":10,"b":5}'
-```
-
-**Résultat attendu :** HTTP **200**, `result: 15`, `status: stored`. C'est **la même Function App** ; seul son chemin d'accès a changé. Peering, Private DNS et règles NSG par défaut rendent la communication possible.
-
-**Point de contrôle 2 :** les deux peerings sont **Connected** ; le DNS renvoie `10.10.2.x` ; le POST Ubuntu réussit ; le POST depuis le PC, hors réseau privé, reste bloqué.
-
-**Si le test échoue :**
-
-- **IP publique dans la réponse DNS :** vérifiez la zone `privatelink.azurewebsites.net`, son enregistrement A et son lien avec VNet-Client.
-- **IP privée, mais timeout TCP :** vérifiez peering, IP du Private Endpoint, routes et éventuelles règles NSG personnalisées.
-- **HTTP 401/403 :** contrôlez la Function key et les restrictions d'accès ; ce n'est pas nécessairement un problème de routage.
-- **HTTP 5xx :** examinez les logs, l'accès Storage et les rôles RBAC.
-
-**Question :** quelles différences entre une route, un enregistrement DNS, une règle NSG et une vérification d'autorisation applicative ?
-
----
-
-## 5. Sécuriser Table Storage : public → bloqué → privé (40–50 min)
-
-**Progression volontaire :** lire d'abord les données depuis **le PC et Ubuntu** avec accès public activé ; désactiver ensuite cet accès **avant** de créer le Private Endpoint ; constater les échecs ; configurer Private Endpoint et DNS ; refaire les tests. **Ne sautez pas les tests d'échec.**
-
-### 5.1 Rappel : Managed Identity, RBAC et réseau
-
-La Function App possède déjà une **System-assigned Managed Identity** avec le rôle **Storage Table Data Contributor**, qui lui permet d'écrire des entités, sous réserve de connectivité réseau. Nous allons maintenant créer une identité **distincte** pour la VM, avec un accès **lecture seule**.
-
-- **Managed Identity** : obtention d'un token d'authentification.
-- **Azure RBAC** : autorisation de lire ou écrire les données.
-- **Private Endpoint + DNS + routage + NSG** : chemin réseau vers le service.
-
-Ces contrôles sont **indépendants et complémentaires**.
-
-### 5.2 Activer l'identité de la VM et attribuer le rôle data-plane
-
-1. **Virtual machines → vm-client-ab12 → Identity → System assigned**.
-2. **Status: On → Save**.
-3. **Storage Account de données → Access control (IAM) → + Add → Add role assignment**.
-4. **Role: Storage Table Data Reader**.
-5. **Members → Managed identity → + Select members → Virtual machine → vm-client-ab12**.
-6. **Review + assign** ; attendez la propagation RBAC.
-
-**Question :** pourquoi le rôle **Reader** pour la VM et **Contributor** pour la Function ? Expliquez le principe de **least privilege**.
-
-### 5.3 Se connecter AVEC l'identité de la VM et tester Storage public
-
-Vous avez utilisé précédemment `az login --use-device-code` pour vous connecter à Azure avec **votre compte utilisateur** et publier la Function. **Activer la Managed Identity sur la VM ne change pas automatiquement la session Azure CLI !**
-
-Dans Ubuntu :
-
-```bash
-az account show --query user -o json
-az logout
-az login --identity
-az account show --query user -o json
-az storage entity query \
-  --account-name '<DATA_STORAGE_ACCOUNT>' \
-  --table-name Calculations \
-  --auth-mode login \
-  --num-results 10 \
-  --output table
-```
-
-**Résultat attendu :** les entités sont affichées. Si vous obtenez `You do not have the required permissions`, vérifiez **d'abord** `az login --identity` et l'attribution du rôle **Storage Table Data Reader** à la VM. Cette erreur a été rencontrée pendant le TP et corrigée en changeant d'identité Azure CLI.
-
-**Tester ensuite depuis le PC :** connectez Azure CLI avec un **compte utilisateur** disposant également du rôle **Storage Table Data Reader** sur le compte de données. Exécutez la même commande `az storage entity query --auth-mode login`. Demandez temporairement ce rôle au formateur si nécessaire. Notez que **les deux machines peuvent lire les données** tant que l'accès réseau public est autorisé et que les identités ont les permissions nécessaires.
-
-### 5.4 Désactiver l'accès public Storage AVANT le Private Endpoint
-
-1. **Storage accounts → <DATA_STORAGE_ACCOUNT> → Networking → Public network access → Disabled → Save**.
-2. **Ne modifiez pas** le Storage Account séparé utilisé par le runtime Azure Functions.
-3. Depuis le **PC**, relancez la commande de lecture Table : **échec attendu**.
-4. Depuis **Ubuntu**, relancez la commande avec la Managed Identity : **échec attendu**, car aucun Private Endpoint `table` n'existe encore.
-5. Notez les deux échecs. Les identités et rôles RBAC n'ont pas changé : c'est maintenant **le réseau** qui bloque l'accès.
-
-> Un blocage réseau Storage renvoie souvent HTTP 403, mais Azure CLI peut afficher un message générique de permissions. Analysez ensemble le réseau, le DNS et l'identité active ; ne concluez pas sur la seule formulation de l'erreur.
-
-### 5.5 Créer le Private Endpoint du service `table`
-
-1. **Storage Account de données → Networking → Private endpoint connections → + Private endpoint**.
-2. **Name** : `pe-table-ab12` ; cible : le **Storage Account de données existant**.
-3. **Target subresource: `table`** (pas `blob`, `file` ou `queue`).
-4. **Virtual network** : `vnet-app-ab12` ; **Subnet** : `snet-private-endpoints`.
-5. **DNS integration: Yes** ; zone **`privatelink.table.core.windows.net`**.
-6. **Review + create → Create** ; vérifiez **Approved** et relevez l'IP privée du Private Endpoint Table.
-7. **Private DNS zones → privatelink.table.core.windows.net → Virtual network links → + Add** : associez **vnet-client-ab12**, avec **auto registration disabled**. Vérifiez également le lien avec VNet-App.
-8. N'ajoutez aucune règle HTTPS NSG personnalisée : les règles par défaut autorisent normalement les échanges entre les VNets peered, en l'absence d'autres restrictions.
-
-### 5.6 Vérifier Private DNS et relire les données depuis Ubuntu
-
-```bash
-nslookup <DATA_STORAGE_ACCOUNT>.table.core.windows.net
-getent ahostsv4 <DATA_STORAGE_ACCOUNT>.table.core.windows.net
-```
-
-**Résultat attendu :** une IP privée du subnet des Private Endpoints, par exemple `10.10.2.x`. La Function App doit elle aussi pouvoir résoudre et joindre l'endpoint Table en privé via sa **VNet Integration sortante**.
-
-Relancez :
-
-```bash
-az storage entity query \
-  --account-name '<DATA_STORAGE_ACCOUNT>' \
-  --table-name Calculations \
-  --auth-mode login \
-  --num-results 10 \
-  --output table
-```
-
-**Résultat attendu :** les entités réapparaissent, cette fois via le Private Endpoint. Depuis le PC non connecté au réseau privé, la lecture doit toujours échouer.
-
-### 5.7 Validation finale de bout en bout
-
-1. Depuis Ubuntu, vérifiez que `nslookup <DATA_STORAGE_ACCOUNT>.table.core.windows.net` renvoie **l'IP privée** (sans `https://` dans la commande).
-2. Vérifiez que `az storage entity query` retourne les lignes via la **Managed Identity de la VM**.
-3. Depuis le PC, retentez la même lecture : l'accès public doit rester bloqué, sauf si le PC utilise déjà un accès réseau privé autorisé.
-4. Depuis Ubuntu, appelez **la même Function App existante** avec une nouvelle opération, par exemple `12 × 22 = 264` :
-
-```bash
-curl -i -X POST 'https://<FUNCTION_APP_NAME>.azurewebsites.net/api/calculate' \
-  -H 'Content-Type: application/json' \
-  -H 'x-functions-key: <FUNCTION_KEY>' \
   -d '{"operation":"multiply","a":12,"b":22}'
 ```
 
-5. Vérifiez HTTP **200**, `result: 264`, `status: stored` et un nouveau `rowKey`.
-6. Relancez `az storage entity query` depuis Ubuntu et retrouvez la **nouvelle entité**. Cela prouve que la Function peut **écrire** après le verrouillage du Storage et que la VM peut **lire** en privé.
+**Résultat attendu :** `/health` renvoie HTTP `200` ; `/api/calculate` renvoie HTTP `200`, `result: 264`, `status: stored` et un `rowKey` généré. Si `TableNotFound` apparaît, créez `Calculations`. En cas de `403`, vérifiez **Storage Table Data Contributor** pour l'identité managée de VM-App et patientez le temps de la propagation RBAC.
 
-Si la Function retourne HTTP 502 après la désactivation de l'accès public Storage, vérifiez **Function App → Networking → Virtual network integration**, le lien VNet-App vers `privatelink.table.core.windows.net` et le rôle **Storage Table Data Contributor** de son identité. Le Private Endpoint **entrant** de la Function ne remplace pas sa VNet Integration **sortante**.
+### Étape B4 — Rendre Flask persistant **avant de supprimer l'IP publique**
 
-**Point de contrôle 3 :** montrer la lecture publique avant restriction, les deux échecs après restriction, la lecture privée Ubuntu après Private Endpoint/DNS, puis l'insertion d'une nouvelle ligne par la Function App.
+Arrêtez le processus Flask au premier plan avec `Ctrl+C`. Sur VM-App, créez un service `systemd` :
 
----
+```bash
+sudo tee /etc/systemd/system/calculator-api.service > /dev/null <<EOF_SERVICE
+[Unit]
+Description=Azure student calculator Flask API
+After=network-online.target
+Wants=network-online.target
 
-## 6. Bilan, questions et nettoyage (20 min)
+[Service]
+Type=simple
+User=azureuser
+WorkingDirectory=/home/azureuser/calculator-api
+Environment=STORAGE_ACCOUNT_NAME=<STORAGE_ACCOUNT>
+Environment=TABLE_NAME=Calculations
+ExecStart=/home/azureuser/calculator-api/.venv/bin/python /home/azureuser/calculator-api/app.py
+Restart=on-failure
+RestartSec=3
 
-### Résultats attendus
+[Install]
+WantedBy=multi-user.target
+EOF_SERVICE
 
-| Test | Résultat attendu | Concept illustré |
-|---|---|---|
-| PC → Function avant restriction | HTTP 200 | Endpoint HTTPS public |
-| PC → Function après restriction | Bloqué | Public network access |
-| Ubuntu → Function avant peering | Échec d'accès privé | Absence de chemin réseau privé |
-| Ubuntu → Function après peering + Private DNS | HTTP 200 | HTTPS privé et règles NSG par défaut |
-| PC et Ubuntu → Table avant restriction | Entités accessibles avec RBAC valide | Accès data-plane public |
-| PC et Ubuntu → Table après restriction, sans PE | Bloqué | Sécurité réseau distincte de RBAC |
-| Ubuntu → Table après PE + DNS + RBAC | Entités accessibles | Private Link + autorisation |
-| Ubuntu → Function, puis Ubuntu → Table | Nouvelle ligne créée et visible | Chaîne applicative privée complète |
-| PC → Table après désactivation du public | Bloqué | Restriction réseau Storage |
+sudo systemctl daemon-reload
+sudo systemctl enable --now calculator-api
+sudo systemctl status calculator-api --no-pager
+curl -i http://127.0.0.1:5000/health
+```
 
-### Questions de compréhension
+**Remplacez `<STORAGE_ACCOUNT>` dans la définition du service avant d'exécuter les commandes.** Consultez les journaux :
 
-1. Pourquoi **VNet Integration** ne suffit-elle pas à rendre l'accès entrant de la Function privé ?
-2. Que permet **VNet peering**, et que ne permet-il **pas** ?
-3. Pourquoi ouvrir SSH 22 en inbound ne bloque-t-il pas HTTPS 443 en outbound ?
-4. Pourquoi les règles NSG par défaut autorisent-elles normalement les échanges entre VNets peered ?
-5. Pourquoi le hostname public de la Function doit-il résoudre vers l'IP du Private Endpoint ?
-6. Pourquoi choisir précisément le subresource **`table`** pour le Private Endpoint Storage ?
-7. Quelles différences entre **Managed Identity**, **Azure RBAC** et **network access** ?
-8. Pourquoi une identité correctement autorisée peut-elle échouer après désactivation de l'accès public Storage ?
-9. Comment distinguer HTTP 403, timeout TCP et échec DNS ?
-10. Pourquoi avons-nous séparé le Storage Account de données et celui du runtime Azure Functions ?
-
-### Nettoyage — uniquement via Azure Portal
-
-1. **Resource groups → rg-az-securelab-ab12**.
-2. Vérifiez que le groupe ne contient **aucune ressource étrangère au TP**.
-3. **Delete resource group** ; saisissez le nom exact puis confirmez.
-4. Attendez la suppression et vérifiez qu'aucune VM, IP publique, Private Endpoint ou autre ressource facturable ne subsiste.
+```bash
+sudo journalctl -u calculator-api -n 60 --no-pager
+```
 
 ---
 
-## 7. Aide au dépannage
+## 5. Phase C — Tester HTTP publiquement depuis le PC local
 
-| Symptôme | Couche probable | Vérifications |
+### Étape C1 — Autoriser temporairement HTTP public
+
+1. **VM-App → Mise en réseau → Paramètres réseau / Règles de ports entrants**, ou ouvrez directement `nsg-app`.
+2. Ajoutez une règle entrante : **Adresses IP source** = `<MY_PUBLIC_IP>/32` ; **Port de destination** `5000` ; **Protocole TCP** ; **Action Autoriser** ; **Priorité 300** ; nom `Allow-HTTP-Student-PC`.
+3. Si un NSG est associé au sous-réseau **et** un autre à la carte réseau, **les deux doivent autoriser** le trafic.
+
+Sur le **PC local**, dans PowerShell :
+
+```powershell
+Invoke-RestMethod -Uri "http://<APP_PUBLIC_IP>:5000/health" -Method GET
+
+Invoke-RestMethod `
+  -Uri "http://<APP_PUBLIC_IP>:5000/api/calculate" `
+  -Method POST `
+  -ContentType "application/json" `
+  -Body '{"operation":"multiply","a":12,"b":22}'
+```
+
+**Résultat attendu :** `status: ok`, puis `result: 264` et `status: stored`.
+
+> N'ouvrez HTTP qu'aux IP nécessaires. Si VM-Client sort avec une autre IP publique, ajoutez une deuxième règle temporaire à la phase suivante. Évitez `Any`, sauf démonstration très courte et strictement supervisée par le formateur.
+
+---
+
+## 6. Phase D — Déployer VNet-Client et tester l'IP publique de VM-App
+
+### Étape D1 — Créer VNet-Client et VM-Client
+
+1. **Réseaux virtuels → Créer** `vnet-client`, espace d'adressage `10.20.0.0/16`, sous-réseau `snet-client` `10.20.1.0/24`.
+2. **Machines virtuelles → Créer** `vm-client` : Ubuntu 24.04 LTS, même région, utilisateur `azureuser`, clé publique SSH, VNet `vnet-client`, sous-réseau `snet-client`, **IP publique activée**.
+3. NSG `nsg-client` : SSH entrant (22) uniquement depuis `<MY_PUBLIC_IP>/32`. VM-Client n'a **pas** besoin d'un port 5000 entrant public.
+4. Activez l'**identité managée affectée par le système** via **VM-Client → Identité → Affectée par le système → Activé → Enregistrer**.
+5. Notez `<CLIENT_PUBLIC_IP>` et `<CLIENT_PRIVATE_IP>`.
+
+Sur le **PC local** :
+
+```powershell
+ssh -i "$HOME\.ssh\<YOUR_PRIVATE_KEY>" azureuser@<CLIENT_PUBLIC_IP>
+```
+
+Sur **VM-Client**, installez les outils de diagnostic et Azure CLI :
+
+```bash
+sudo apt update
+sudo apt install -y curl dnsutils iputils-ping openssh-client ca-certificates
+curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+az version
+```
+
+### Étape D2 — Tester VM-App via son **IP publique** depuis VM-Client
+
+Sur VM-Client :
+
+```bash
+curl -i --connect-timeout 5 http://<APP_PUBLIC_IP>:5000/health
+```
+
+Si la requête expire, le NSG de VM-App n'autorise peut-être que l'IP publique de votre PC. **Identifiez l'IP publique réelle de sortie de VM-Client** :
+
+```bash
+curl -4 https://api.ipify.org
+```
+
+Dans `nsg-app`, ajoutez une règle **temporaire** autorisant TCP 5000 depuis `<CLIENT_EGRESS_PUBLIC_IP>/32`, par exemple priorité `310`, nom `Allow-HTTP-Client-Public`. Réessayez. **Ne supposez pas** que l'IP publique de sortie est identique à l'IP publique entrante de VM-Client : vérifiez-la.
+
+**Résultat attendu :** HTTP 200. À ce stade, les VNets ne sont pas appairés : le trafic utilise le point d'accès **public** de VM-App.
+
+### Étape D3 — Observer l'isolation avant le peering
+
+Depuis VM-Client :
+
+```bash
+curl -v --connect-timeout 5 http://<APP_PRIVATE_IP>:5000/health
+```
+
+**Résultat attendu :** échec ou expiration, car VNet-Client n'a pas de chemin réseau privé vers VNet-App. Ne vous fiez pas uniquement à `ping` : ICMP peut être bloqué indépendamment de TCP. **`curl` est le test applicatif de référence**.
+
+---
+
+## 7. Phase E — Supprimer l'IP publique de VM-App, puis appairer les VNets
+
+### Étape E1 — Supprimer l'IP publique de VM-App
+
+**Avant de continuer :** vérifiez que `calculator-api` tourne comme service `systemd` et que vous avez noté l'IP privée de VM-App.
+
+1. **VM-App → Mise en réseau → Interface réseau** (ouvrez la ressource NIC).
+2. **Configurations IP → `ipconfig1` → Adresse IP publique → Dissocier / Aucune → Enregistrer**. Les libellés du portail peuvent varier.
+3. Vérifiez que VM-App conserve `<APP_PRIVATE_IP>` mais **n'a plus d'IP publique**.
+
+Effectuez les tests suivants :
+
+- PC local → SSH vers l'**ancienne** `<APP_PUBLIC_IP>` : **échec attendu**.
+- PC local → HTTP vers l'**ancienne** `<APP_PUBLIC_IP>:5000` : **échec attendu**.
+- VM-Client → HTTP vers l'**ancienne** `<APP_PUBLIC_IP>:5000` : **échec attendu**.
+- VM-Client → HTTP vers `<APP_PRIVATE_IP>:5000` : **toujours en échec** avant le peering.
+
+Utilisez un délai maximal de 5 secondes pour `curl`. L'ancienne IP publique peut être réattribuée plus tard : une réponse inattendue ne prouve pas que votre VM est encore accessible.
+
+> La suppression de l'IP publique **ne supprime pas automatiquement** tout accès Internet sortant : cela dépend de la configuration réseau Azure. Vérifiez que le service fonctionne avant de supprimer l'IP, et évitez de dépendre de nouvelles installations de paquets ensuite.
+
+### Étape E2 — Créer un **VNet Peering bidirectionnel**
+
+1. **VNet-App → Peerings → Ajouter**.
+2. Appairez avec `vnet-client` et configurez le peering inverse de `vnet-client` vers `vnet-app` (le portail peut créer les deux en une seule opération).
+3. Autorisez **l'accès au réseau virtuel** dans les deux sens. Conservez les paramètres par défaut pour le transit de passerelle et le trafic transféré, sauf instruction contraire.
+4. Vérifiez l'état **Connected / Connecté** sur les deux peerings.
+
+Sur **VM-Client** :
+
+```bash
+curl -i --connect-timeout 5 http://<APP_PRIVATE_IP>:5000/health
+curl -i -X POST http://<APP_PRIVATE_IP>:5000/api/calculate \
+  -H 'Content-Type: application/json' \
+  -d '{"operation":"multiply","a":12,"b":22}'
+```
+
+**Résultat attendu :** HTTP 200 si le NSG et le pare-feu invité autorisent la connexion. **La règle NSG par défaut `AllowVNetInBound` autorise souvent déjà les VNets appairés.** Une règle personnalisée n'est pas systématiquement nécessaire.
+
+### Étape E3 — Exercice de dépannage NSG
+
+Si `curl` privé échoue, vérifiez dans cet ordre :
+
+1. Peerings **Connectés** dans les deux sens ; IP privée correcte ; service Flask actif.
+2. Règles de sécurité effectives sur la NIC et le sous-réseau de VM-App ; recherchez un refus de priorité supérieure.
+3. Pare-feu de l'OS (`sudo ufw status` sur VM-App, s'il est activé).
+4. Si nécessaire seulement, ajoutez une règle NSG entrante **Allow** : source `10.20.0.0/16`, destination `<APP_PRIVATE_IP>`, TCP, port `5000`, priorité `300` **si libre et non annulée par un refus plus prioritaire**.
+5. Relancez `curl` vers l'IP privée.
+
+**Expérience facultative :** créez temporairement une règle entrante **Deny** sur VM-App pour TCP 5000 depuis `10.20.0.0/16`, priorité `250`. Vérifiez que `curl` échoue, puis **supprimez cette règle** et vérifiez le retour du succès. Cela démontre les priorités NSG sans dépendre d'une mauvaise configuration accidentelle.
+
+### Étape E4 — Facultatif : se connecter en SSH privé de VM-Client vers VM-App
+
+VM-App n'a plus d'IP publique. Après le peering, vous pouvez l'administrer depuis VM-Client si une clé SSH autorisée est configurée.
+
+**Configuration sûre :** sur VM-Client, générez une **nouvelle** paire de clés ; affichez uniquement la **clé publique** :
+
+```bash
+ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519_lab -N ''
+cat ~/.ssh/id_ed25519_lab.pub
+```
+
+Copiez la ligne publique `ssh-ed25519 ...`. Dans **Portail Azure → VM-App → Exécuter une commande → RunShellScript**, exécutez le script suivant en remplaçant `<CLIENT_VM_PUBLIC_KEY>` par la clé publique complète :
+
+```bash
+sudo mkdir -p /home/azureuser/.ssh
+printf '%s\n' '<CLIENT_VM_PUBLIC_KEY>' | sudo tee -a /home/azureuser/.ssh/authorized_keys >/dev/null
+sudo chown -R azureuser:azureuser /home/azureuser/.ssh
+sudo chmod 700 /home/azureuser/.ssh
+sudo chmod 600 /home/azureuser/.ssh/authorized_keys
+```
+
+**Ne copiez jamais la clé privée** dans le portail ni entre les VM. Sur VM-Client :
+
+```bash
+ssh -i ~/.ssh/id_ed25519_lab azureuser@<APP_PRIVATE_IP>
+sudo systemctl status calculator-api --no-pager
+```
+
+La fonctionnalité **Exécuter une commande** du portail permet aussi d'inspecter VM-App sans IP publique, même si SSH ne fonctionne pas encore.
+
+---
+
+## 8. Phase F — Tester publiquement Azure Table Storage avec Azure CLI
+
+Flask utilise déjà **l'identité managée affectée par le système de VM-App** pour écrire dans Storage. Comparez maintenant deux identités **Azure CLI** distinctes :
+
+| Client | Identité | Rôle nécessaire | Test |
+|---|---|---|---|
+| PC local | Utilisateur Entra de l'étudiant via `az login` | `Storage Table Data Reader` | `az storage entity query` |
+| VM-Client | Identité managée de VM-Client via `az login --identity` | `Storage Table Data Reader` | `az storage entity query` |
+| Flask sur VM-App | Identité managée de VM-App via le SDK Python | `Storage Table Data Contributor` | `create_entity()` |
+
+### Étape F1 — Attribuer le rôle de lecture à VM-Client
+
+**Compte Storage → Contrôle d'accès (IAM) → Ajouter une attribution de rôle → Storage Table Data Reader → Identité managée → Machine virtuelle → `vm-client` → Vérifier + attribuer**.
+
+Vérifiez également que **l'utilisateur Azure connecté sur votre PC** dispose de `Storage Table Data Reader`. Attendez la propagation des attributions.
+
+### Étape F2 — Tester depuis le PC local (point d'accès public)
+
+Sur le **PC local**, dans PowerShell :
+
+```powershell
+az login
+az account show --output table
+az storage entity query `
+  --account-name <STORAGE_ACCOUNT> `
+  --table-name Calculations `
+  --auth-mode login `
+  --num-results 10 `
+  --output table
+```
+
+**Résultat attendu :** la requête réussit et affiche les lignes déjà enregistrées. En présence de plusieurs abonnements, sélectionnez le bon avec `az account set --subscription "<SUBSCRIPTION_ID>"`.
+
+### Étape F3 — Tester depuis VM-Client (point d'accès public)
+
+Sur **VM-Client** :
+
+```bash
+az logout 2>/dev/null || true
+az login --identity
+az account show --output table
+az storage entity query \
+  --account-name <STORAGE_ACCOUNT> \
+  --table-name Calculations \
+  --auth-mode login \
+  --num-results 10 \
+  --output table
+```
+
+**Résultat attendu :** la requête réussit. `az logout` évite de réutiliser une ancienne session interactive ; `az login --identity` sélectionne l'identité managée de la VM. Si cette identité voit plusieurs abonnements, choisissez le bon.
+
+**Vérifiez le DNS avant la privatisation**, depuis VM-Client :
+
+```bash
+nslookup <STORAGE_ACCOUNT>.table.core.windows.net
+```
+
+**Résultat attendu :** adresse publique du service Storage, éventuellement après une chaîne CNAME. L'IP publique exacte peut varier.
+
+---
+
+## 9. Phase G — Désactiver l'accès public de Storage et observer les échecs
+
+1. **Compte Storage → Mise en réseau → Pare-feu et réseaux virtuels / Accès réseau public**.
+2. Choisissez **Désactivé** pour **Accès réseau public**, puis enregistrez. Ne désactivez pas le compte Storage lui-même.
+3. Attendez l'application du paramètre réseau.
+
+**Retestez depuis le PC local** :
+
+```powershell
+az storage entity query `
+  --account-name <STORAGE_ACCOUNT> `
+  --table-name Calculations `
+  --auth-mode login `
+  --num-results 10 `
+  --output table
+```
+
+**Retestez depuis VM-Client** :
+
+```bash
+az storage entity query \
+  --account-name <STORAGE_ACCOUNT> \
+  --table-name Calculations \
+  --auth-mode login \
+  --num-results 10 \
+  --output table
+```
+
+**Retestez l'application depuis VM-Client** :
+
+```bash
+curl -i -X POST http://<APP_PRIVATE_IP>:5000/api/calculate \
+  -H 'Content-Type: application/json' \
+  -d '{"operation":"multiply","a":12,"b":22}'
+```
+
+**Résultat attendu :** les deux requêtes Azure CLI vers les données échouent à cause de la restriction réseau publique de Storage, et l'écriture Flask échoue (l'API d'exemple renvoie HTTP 502). Les messages et codes HTTP exacts peuvent varier ; un `403` peut venir d'une restriction réseau **ou** d'un manque de droits RBAC. **Vérifiez donc que les deux requêtes fonctionnaient en phase F.** La route Flask `/health` doit continuer à renvoyer 200, car elle n'accède pas à Storage.
+
+> Désactiver l'accès public ne bloque pas les opérations de gestion du portail Azure. Le test concerne les **requêtes de données Table Storage**. Le DNS peut continuer à résoudre une IP publique tant que le DNS privé n'est pas configuré.
+
+---
+
+## 10. Phase H — Créer le Private Endpoint Storage et le DNS privé
+
+### Étape H1 — Créer le Private Endpoint pour le service **table**
+
+1. **Compte Storage → Mise en réseau → Connexions de point de terminaison privé → + Point de terminaison privé** (ou **Centre Private Link → Points de terminaison privés → Créer**).
+2. Nom `pe-storage-table` ; groupe `rg-private-lab` ; même région.
+3. Ressource cible : votre compte Storage ; **Sous-ressource cible = `table`**. **Ne choisissez pas** `blob` ou `file`.
+4. Réseau virtuel `vnet-app` ; sous-réseau `snet-private-endpoints`.
+5. Dans **DNS**, choisissez **Intégrer à une zone DNS privée = Oui** et utilisez/créez `privatelink.table.core.windows.net`.
+6. Créez la ressource. Vérifiez que la connexion Private Endpoint est **Approved / Approuvée** et notez `<STORAGE_PE_PRIVATE_IP>`.
+
+### Étape H2 — Lier la zone DNS privée aux **deux VNets**
+
+1. **Zones DNS privées → `privatelink.table.core.windows.net`**.
+2. Dans **Jeux d'enregistrements**, vérifiez qu'un enregistrement **A** portant le nom du compte Storage pointe vers `<STORAGE_PE_PRIVATE_IP>`. Azure le crée généralement automatiquement via le groupe de zones DNS privées.
+3. **Liens de réseau virtuel → + Ajouter** : liez `vnet-app`, **inscription automatique désactivée**.
+4. Ajoutez un second lien vers `vnet-client`, **inscription automatique désactivée**.
+5. Vérifiez que les deux liens sont **Completed / Terminés**.
+
+> Lier uniquement VNet-App ne suffit pas : VM-Client doit aussi résoudre le nom Storage vers l'IP du Private Endpoint. Le SDK et Azure CLI utilisent toujours le **nom DNS normal** `<STORAGE_ACCOUNT>.table.core.windows.net`, jamais directement le nom `privatelink` ni l'IP brute.
+
+### Étape H3 — Valider le DNS depuis VM-Client et VM-App
+
+Sur **VM-Client** :
+
+```bash
+nslookup <STORAGE_ACCOUNT>.table.core.windows.net
+```
+
+**Résultat attendu :** le nom Storage habituel résout, souvent via un CNAME `privatelink`, vers `<STORAGE_PE_PRIVATE_IP>`, une adresse du réseau `10.10.2.0/24`.
+
+Si SSH privé a été configuré à l'étape E4, exécutez la même commande sur **VM-App** :
+
+```bash
+nslookup <STORAGE_ACCOUNT>.table.core.windows.net
+```
+
+Vous pouvez aussi passer par **VM-App → Exécuter une commande → RunShellScript**. Les deux VM doivent résoudre vers la même IP privée du Private Endpoint. La propagation DNS peut prendre un peu de temps : vérifiez d'abord les liens et les enregistrements.
+
+### Étape H4 — Retester Storage depuis VM-Client (accès privé)
+
+Sur **VM-Client** :
+
+```bash
+az logout 2>/dev/null || true
+az login --identity
+az storage entity query \
+  --account-name <STORAGE_ACCOUNT> \
+  --table-name Calculations \
+  --auth-mode login \
+  --num-results 10 \
+  --output table
+```
+
+**Résultat attendu :** succès, cette fois via l'**IP privée** de Storage. VM-Client atteint le Private Endpoint grâce au VNet Peering vers VNet-App. En cas d'échec, vérifiez l'approbation du Private Endpoint, la sous-ressource `table`, les liens DNS des deux VNets, la résolution DNS, RBAC et les règles NSG effectives.
+
+### Étape H5 — Retester Storage depuis le **PC local** (toujours bloqué)
+
+Sur le **PC local**, répétez la requête de l'étape F2.
+
+**Résultat attendu :** l'accès aux données reste bloqué. Le PC n'appartient à aucun des deux VNets et n'a pas de route privée vers le Private Endpoint. Sa résolution DNS reste généralement publique. Une configuration VPN/DNS privé pourrait modifier ce comportement ; le TP suppose que le PC utilise l'Internet public ordinaire.
+
+---
+
+## 11. Phase I — Validation privée finale de bout en bout
+
+Depuis **VM-Client**, appelez l'API avec l'**IP privée** de VM-App :
+
+```bash
+curl -i -X POST http://<APP_PRIVATE_IP>:5000/api/calculate \
+  -H 'Content-Type: application/json' \
+  -d '{"operation":"multiply","a":12,"b":22}'
+```
+
+**Exemple de réponse attendue** (identifiants variables) :
+
+```json
+{
+  "operation": "multiply",
+  "a": 12,
+  "b": 22,
+  "result": 264,
+  "status": "stored",
+  "rowKey": "<GENERATED_UUID>",
+  "requestId": "<GENERATED_ID>"
+}
+```
+
+Vérifiez l'enregistrement avec **l'identité managée de VM-Client** :
+
+```bash
+az storage entity query \
+  --account-name <STORAGE_ACCOUNT> \
+  --table-name Calculations \
+  --auth-mode login \
+  --num-results 20 \
+  --output table
+```
+
+Comparez le `rowKey` de la réponse avec le `RowKey` dans la table. Si vous avez accès à VM-App en SSH privé, consultez les journaux :
+
+```bash
+sudo journalctl -u calculator-api -n 80 --no-pager
+```
+
+**Flux final à expliquer au formateur :**
+
+1. VM-Client envoie une requête HTTP à l'**IP privée** de VM-App via VNet Peering.
+2. VM-App effectue le calcul Flask.
+3. Python obtient un jeton grâce à **l'identité managée affectée par le système de VM-App**.
+4. Azure RBAC accorde à cette identité le rôle **Storage Table Data Contributor**.
+5. Le DNS résout le point d'accès Table Storage vers l'**IP du Private Endpoint**.
+6. VM-App écrit l'entité par la connectivité réseau privée.
+7. VM-Client utilise **sa propre** identité managée (`Storage Table Data Reader`) pour vérifier la ligne via le même Private Endpoint.
+8. Le PC local ne peut toujours pas interroger Storage depuis l'Internet public.
+
+### Matrice de connectivité attendue
+
+| Test | Phase publique initiale | IP publique de VM-App supprimée, avant peering | Après peering, avant verrouillage Storage | Storage public désactivé, avant PE | État final : PE + DNS |
+|---|---|---|---|---|---|
+| PC → IP publique Flask VM-App | OK | Échec | Échec | Échec | Échec |
+| VM-Client → IP publique Flask VM-App | OK | Échec | Échec | Échec | Échec |
+| VM-Client → IP privée Flask VM-App `/health` | Échec (pas de peering) | Échec | OK | OK | OK |
+| PC → données Table Storage via Azure CLI | OK | OK | OK | Échec | Échec |
+| VM-Client → données Table Storage via Azure CLI | OK | OK | OK | Échec | OK en privé |
+| VM-App → écriture Table Storage via Flask | OK | OK* | OK | Échec | OK en privé |
+
+\*Sous réserve que VM-App conserve une connectivité sortante vers le service Storage public après suppression de son IP publique. Sinon, diagnostiquez la configuration de sortie Azure plutôt qu'un problème d'identité managée.
+
+---
+
+## 12. Guide de dépannage
+
+| Symptôme | Cause probable | Vérification / action |
 |---|---|---|
-| DNS renvoie une IP publique | DNS | Recordset A, zone Private DNS et VNet link |
-| DNS privé, mais timeout TCP | Réseau | Peering, règles NSG effectives, routes, IP Private Endpoint / 443 |
-| HTTP 401/403 sur la Function | HTTP / sécurité | Function key, accès public, restrictions applicatives |
-| HTTP 400 | Application | JSON, opération, division par zéro |
-| HTTP 502 sur l'API | Application → Storage | Managed Identity, RBAC, endpoint Table, DNS, VNet Integration |
-| Storage HTTP 403 | RBAC ou firewall Storage | Rôle et scope, token, Public network access, Private Endpoint |
-| `az login --identity` échoue | Identité | System-assigned identity de la VM, disponibilité IMDS |
-| `You do not have the required permissions` | Identité ou RBAC | `az login --identity` puis rôle `Storage Table Data Reader` |
-| `InvalidResourceName` dans les logs | Configuration applicative | `DATA_STORAGE_ACCOUNT` doit contenir le **nom seul** du compte |
-| `nslookup https://...` → NXDOMAIN | Syntaxe DNS | Retirer `https://` ; utiliser uniquement le hostname |
-| Core Tools : Node.js 18 / `ERR_REQUIRE_ESM` | Outils Ubuntu | Installer Node.js 22 avant Core Tools v4 |
-| `func: Permission denied` | Outils Ubuntu | Vérifier la cible du lien symbolique et ses permissions |
+| `TableNotFound` | Table `Calculations` absente ou mauvais compte/casse | Compte Storage → **Tables** ; créer `Calculations` |
+| Flask renvoie `502` | Échec d'écriture Storage | `sudo journalctl -u calculator-api -n 80 --no-pager` ; lire l'exception Azure sous-jacente |
+| Storage `403` avant verrouillage | RBAC absent, mauvaise identité ou règle réseau | Vérifier `Storage Table Data Contributor` sur VM-App ; `Storage Table Data Reader` sur VM-Client/utilisateur ; attendre la propagation |
+| `az login --identity` échoue | Identité managée désactivée, IMDS inaccessible ou mauvaise machine | VM-Client → **Identité** ; vérifier « Affectée par le système = Activé » ; exécuter sur la VM Azure |
+| Azure CLI utilise le compte personnel au lieu de la VM | Ancienne connexion interactive active | Sur VM-Client : `az logout`, puis `az login --identity` et `az account show` |
+| HTTP public expire | Mauvaise IP publique, Flask arrêté, IP source refusée, NSG/pare-feu | Vérifier service, `curl localhost`, règle NSG `/32` et IP publique de la VM |
+| HTTP privé expire après peering | Peering déconnecté, refus NSG, mauvaise IP privée, pare-feu invité | Vérifier peering **Connected**, règles NSG effectives, écoute Flask sur `0.0.0.0:5000` |
+| SSH vers VM-App ne fonctionne plus après suppression IP | Normal : plus de point d'entrée public | SSH depuis VM-Client après peering ou **Exécuter une commande** dans le portail |
+| DNS Storage renvoie encore une IP publique après PE | Enregistrement A ou lien VNet absent, mauvaise zone | Vérifier `privatelink.table.core.windows.net`, enregistrement A, liens aux **deux** VNets |
+| DNS privé correct mais requête Storage en échec | PE non approuvé, mauvaise sous-ressource, NSG/routage ou RBAC | Vérifier PE `table`, statut approuvé, port 443 et rôles d'accès aux données |
+| `ManagedIdentityCredential` échoue | Identité de VM-App désactivée ou indisponible | VM-App → Identité ; lire les journaux ; le SDK utilise l'identité VM indépendamment d'Azure CLI |
+| Installation de paquets impossible | Accès sortant de la VM indisponible | Installer avant de supprimer l'IP publique de VM-App ; vérifier les sorties réseau et dépôts |
 
-### Documentation officielle
+### Commandes de diagnostic réseau facultatives
 
-- [Azure Functions — Networking options](https://learn.microsoft.com/en-us/azure/azure-functions/functions-networking-options)
-- [Azure Private Endpoint — Network policies](https://learn.microsoft.com/en-us/azure/private-link/disable-private-endpoint-network-policy)
-- [Azure Functions Core Tools](https://learn.microsoft.com/en-us/azure/azure-functions/functions-run-local)
-- [Installer Azure CLI](https://learn.microsoft.com/en-us/cli/azure/install-azure-cli)
-- [Autoriser l'accès à Table Storage avec Microsoft Entra ID](https://learn.microsoft.com/en-us/azure/storage/tables/authorize-access-azure-active-directory)
+Sur VM-Client :
 
-> **Note pédagogique :** ce document reprend les étapes et les problèmes effectivement rencontrés pendant une exécution du TP. Les intitulés du Portal et les fonctionnalités disponibles peuvent varier selon la région, l'abonnement et les évolutions d'Azure.
+```bash
+# L'application est-elle accessible en privé ?
+curl -v --connect-timeout 5 http://<APP_PRIVATE_IP>:5000/health
+
+# Storage se résout-il vers une IP privée ?
+nslookup <STORAGE_ACCOUNT>.table.core.windows.net
+
+# Le port HTTPS 443 accepte-t-il une connexion ? (pas un test RBAC)
+curl -v --connect-timeout 5 https://<STORAGE_ACCOUNT>.table.core.windows.net/
+```
+
+Une réponse HTTP `403` ou une autre réponse du service à cette dernière commande peut prouver que la connexion réseau atteint Azure Storage ; **elle ne prouve pas** que l'accès aux données est autorisé.
+
+---
+
+## 13. Questions de vérification des acquis
+
+1. Quelle différence existe-t-il entre l'IP publique et l'IP privée d'une VM ?
+2. Pourquoi VM-Client ne peut-elle pas joindre l'IP privée de VM-App avant le VNet Peering ?
+3. Le VNet Peering contourne-t-il automatiquement une règle NSG restrictive ?
+4. Pourquoi `/health` peut-il fonctionner alors que `/api/calculate` échoue après la désactivation de l'accès public de Storage ?
+5. Que remplace `ManagedIdentityCredential()` dans l'application ?
+6. Quelle différence existe-t-il entre `Storage Table Data Reader` et `Storage Table Data Contributor` ?
+7. Pourquoi lier la zone DNS privée aux deux VNets ?
+8. Pourquoi le PC local ne peut-il toujours pas interroger Storage après la création du Private Endpoint ?
+9. Quelle ressource nécessite un Private Endpoint : VM-App, le compte Storage ou les deux ?
+10. Quels outils permettent de distinguer une erreur applicative d'une erreur DNS, réseau ou RBAC ?
+
+## 14. Nettoyage — obligatoire
+
+1. Conservez les captures d'écran ou notes demandées par le formateur.
+2. **Portail Azure → Groupes de ressources → `rg-private-lab` → Supprimer le groupe de ressources**.
+3. Saisissez le nom du groupe pour confirmer. Attendez la fin de la suppression.
+4. Vérifiez qu'il ne reste aucune ressource du TP (IP publiques, disques managés, Private Endpoints, zones DNS privées). Supprimez séparément toute ressource créée hors du groupe.
+
+**TP terminé :** vous avez démontré l'accès public, l'isolation réseau, le VNet Peering, le contrôle NSG, les identités managées et Azure RBAC, la désactivation de l'accès public à Table Storage, le Private Endpoint, le DNS privé et la validation privée de bout en bout.
